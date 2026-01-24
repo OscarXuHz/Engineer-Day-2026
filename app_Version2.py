@@ -8,6 +8,7 @@ import random
 import streamlit.components.v1 as components
 import geopandas as gpd
 from folium.plugins import HeatMap
+import math
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="CoolPath: Urban Heat Navigator", layout="wide")
@@ -111,6 +112,52 @@ with st.spinner("Loading City Digital Twin..."):
     G, node_xy, df_hotspots, safe_center, heat_points = load_data()
     nodes_list = list(G.nodes())
 
+def _haversine(lat1, lon1, lat2, lon2):
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+# Build planner guidance items from the same data used by the heatmap
+guidance_items = []
+
+def _spread_points(points, min_distance_m=150):
+    selected = []
+    for lat, lon, weight in points:
+        too_close = False
+        for s in selected:
+            if _haversine(lat, lon, s[0], s[1]) < min_distance_m:
+                too_close = True
+                break
+        if not too_close:
+            selected.append((lat, lon, weight))
+    return selected
+
+if len(heat_points) > 0:
+    # Take more points, then spread them out to avoid clustering
+    candidates = sorted(heat_points, key=lambda x: x[2], reverse=True)[:200]
+    top_points = _spread_points(candidates, min_distance_m=180)[:15]
+    for lat, lon, weight in top_points:
+        guidance_items.append({
+            "label": f"High-heat segment (heat={weight:.2f})",
+            "lat": lat,
+            "lon": lon,
+            "action": "Prioritize canopy + cooling pavement"
+        })
+elif not df_hotspots.empty and {'x', 'y'}.issubset(df_hotspots.columns):
+    candidates = [(row['y'], row['x'], 1.0) for _, row in df_hotspots.iterrows()]
+    top_points = _spread_points(candidates, min_distance_m=180)[:15]
+    for lat, lon, _ in top_points:
+        guidance_items.append({
+            "label": "Hotspot cluster",
+            "lat": lat,
+            "lon": lon,
+            "action": "Add shade trees + reflective surfaces"
+        })
+
 # --- 2. SIDEBAR CONTROLS ---
 st.sidebar.header("🕹️ Simulation Controls")
 
@@ -123,11 +170,47 @@ scenario = st.sidebar.radio(
 # Simulation Logic: If Heatwave, we increase penalty
 heat_multiplier = 10 # Default
 if "Heatwave" in scenario:
-    st.sidebar.error("⚠️ HEATWAVE ACTIVE: Penalties for unshaded roads increased by 200%!")
+    st.sidebar.error("⚠️ HEATWAVE ACTIVE: Penalties for unshaded roads increased by 174.5%!")
     heat_multiplier = 30 # Huge penalty for concrete
+
+# Walking speed for time estimates
+st.sidebar.markdown("**Walking Speed (km/h)**")
+walk_speed_kmh = st.sidebar.slider("Speed", min_value=2.0, max_value=7.0, value=4.8, step=0.1)
+walk_speed_mps = walk_speed_kmh * 1000 / 3600
 
 # Route Generator
 st.sidebar.subheader("Plan a Route")
+
+# Coordinate-based start/end selection
+st.sidebar.markdown("**Set Start/End by Coordinates**")
+start_lat = st.sidebar.number_input("Start Latitude", value=34.118457, format="%.6f", step=0.000100)
+start_lon = st.sidebar.number_input("Start Longitude", value=-118.274520, format="%.6f", step=0.000100)
+end_lat = st.sidebar.number_input("End Latitude", value=34.098322, format="%.6f", step=0.000100)
+end_lon = st.sidebar.number_input("End Longitude", value=-118.296184, format="%.6f", step=0.000100)
+
+def _nearest_node(lat, lon, node_xy_dict):
+    best_node = None
+    best_dist = float("inf")
+    for node_id, (nlat, nlon) in node_xy_dict.items():
+        d = _haversine(lat, lon, nlat, nlon)
+        if d < best_dist:
+            best_dist = d
+            best_node = node_id
+    return best_node, best_dist
+
+if st.sidebar.button("📍 Use These Coordinates"):
+    if len(node_xy) == 0:
+        st.sidebar.error("No node coordinate data available.")
+    else:
+        start_node, start_d = _nearest_node(start_lat, start_lon, node_xy)
+        end_node, end_d = _nearest_node(end_lat, end_lon, node_xy)
+        if start_node is None or end_node is None:
+            st.sidebar.error("Could not find nearest nodes for the given coordinates.")
+        else:
+            st.session_state['start'] = start_node
+            st.session_state['end'] = end_node
+            st.sidebar.success(f"Start matched within {int(start_d)}m, End within {int(end_d)}m")
+
 if st.sidebar.button("🎲 Generate Random Route"):
     # Pick random points from the largest connected component
     try:
@@ -181,10 +264,24 @@ if 'start' in st.session_state:
         # Calculate Stats
         saved_dist = int(len_cool - len_fast)
         
+        # Time estimates (minutes)
+        time_fast_min = len_fast / walk_speed_mps / 60
+        time_cool_min = len_cool / walk_speed_mps / 60
+
         # --- 4. DISPLAY METRICS ---
         col1, col2, col3 = st.columns(3)
-        col1.metric("Fastest Route (Red)", f"{int(len_fast)} m", "High Heat Exposure", delta_color="inverse")
-        col2.metric("CoolPath (Green)", f"{int(len_cool)} m", f"+{saved_dist}m longer", delta_color="normal")
+        col1.metric(
+            "Fastest Route (Red)",
+            f"{int(len_fast)} m",
+            f"~{time_fast_min:.1f} min",
+            delta_color="inverse"
+        )
+        col2.metric(
+            "CoolPath (Green)",
+            f"{int(len_cool)} m",
+            f"~{time_cool_min:.1f} min (+{saved_dist}m)",
+            delta_color="normal"
+        )
         col3.metric("Current Condition", scenario)
 
     except Exception as e:
@@ -210,7 +307,7 @@ else:
     map_center = [34.05, -118.25]
 
 # --- 5. MAP RENDERING ---
-m = folium.Map(location=map_center, zoom_start=15, tiles=None)
+m = folium.Map(location=map_center, zoom_start=14, tiles=None)
 
 # Basemap switcher
 folium.TileLayer("CartoDB positron", name="Light (CartoDB)").add_to(m)
@@ -221,15 +318,6 @@ folium.TileLayer(
     name="Terrain (OpenTopo)",
     attr="Map data © OpenStreetMap contributors, SRTM | Map style © OpenTopoMap (CC-BY-SA)",
 ).add_to(m)
-
-# Debug panel
-with st.expander("Debug Map Data", expanded=False):
-    st.write("Map center:", map_center)
-    try:
-        sample_key = next(iter(node_xy.keys())) if len(node_xy) > 0 else None
-        st.write("Sample node:", sample_key, node_xy.get(sample_key))
-    except Exception as e:
-        st.write("Sample node error:", e)
 
 # Draw Routes if they exist
 if 'start' in st.session_state:
@@ -242,8 +330,6 @@ if 'start' in st.session_state:
 
     if len(route_fast) > 1:
         coords_fast = [[node_xy[n][0], node_xy[n][1]] for n in route_fast if n in node_xy]
-        with st.expander("Debug Routes", expanded=False):
-            st.write("Fast coords sample:", coords_fast[:3])
         folium.PolyLine(coords_fast, color="red", weight=5, opacity=0.6, tooltip="Fastest Route").add_to(m)
         
         # Start/End Markers
@@ -252,26 +338,23 @@ if 'start' in st.session_state:
 
     if len(route_cool) > 1:
         coords_cool = [[node_xy[n][0], node_xy[n][1]] for n in route_cool if n in node_xy]
-        with st.expander("Debug Routes", expanded=False):
-            st.write("Cool coords sample:", coords_cool[:3])
         folium.PolyLine(coords_cool, color="green", weight=5, opacity=0.8, tooltip="CoolPath").add_to(m)
 
     # Always draw a marker to verify map renders
     if len(route_fast) > 0 and route_fast[0] in node_xy:
         folium.Marker([node_xy[route_fast[0]][0], node_xy[route_fast[0]][1]], popup="Start").add_to(m)
 
-# Draw Hotspots (For the 'Planner' view)
-# Toggle to show/hide
-show_hotspots = st.checkbox("Show Priority Planting Zones (Planner View)")
-if show_hotspots and not df_hotspots.empty:
-    for idx, row in df_hotspots.iterrows():
+# Draw Planner Focus Areas (aligned to heatmap)
+show_hotspots = st.checkbox("Show Priority Focus Areas (Planner View)")
+if show_hotspots and len(guidance_items) > 0:
+    for item in guidance_items:
         folium.CircleMarker(
-            location=[row['y'], row['x']],
-            radius=10,
+            location=[item['lat'], item['lon']],
+            radius=9,
             color="orange",
             fill=True,
             fill_color="orange",
-            popup="🔥 High Heat / Low Canopy"
+            popup=item['action']
         ).add_to(m)
 
 # Heatmap layer
@@ -285,7 +368,23 @@ folium.LayerControl(position="topright", collapsed=False).add_to(m)
 # Use direct HTML rendering to avoid blank iframe issues with st_folium
 components.html(m._repr_html_(), height=520)
 
-# --- 6. EXPLANATION (For the Video Pitch) ---
+# --- 6. PLANNER INSTRUCTIONS ---
+st.markdown("---")
+with st.expander("Planner Guidance: Priority Areas to Improve", expanded=False):
+    st.write(
+        "Below are priority focus areas for urban cooling interventions (tree planting, shade structures, "
+        "cool pavement). For this demo, these are derived from the hottest segments or simulated hotspots."
+    )
+
+    if guidance_items:
+        for i, item in enumerate(guidance_items, start=1):
+            st.markdown(
+                f"{i}. **{item['label']}** — ({item['lat']:.5f}, {item['lon']:.5f}) → {item['action']}"
+            )
+    else:
+        st.info("No hotspot data available yet. Run Phase 2 to generate hotspots.csv or enable the heatmap.")
+
+# --- 7. EXPLANATION (For the Video Pitch) ---
 st.markdown("---")
 st.subheader("How it works")
 st.write(f"""
